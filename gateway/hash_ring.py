@@ -1,58 +1,135 @@
-# from the kvstore root
-cat > gateway/hash_ring.py << 'EOF'
-import bisect
-import hashlib
+import os
+import socket
+from contextlib import contextmanager
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from hash_ring import HashRing
+
+app = FastAPI(title="KV Store Gateway")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-class HashRing:
-    """
-    consistent hash ring w/ virtual nodes.
+def _load_nodes() -> dict:
+    raw = os.environ.get("KV_NODES", "127.0.0.1:7070")
+    nodes = {}
+    for entry in raw.split(","):
+        host, port = entry.strip().split(":")
+        nodes[entry.strip()] = {"host": host, "port": int(port)}
+    return nodes
 
-    each real node gets hashed to `vnodes` points scattered around a
-    circle (0 to 2^128, since we're using md5). a key is looked up by
-    hashing it onto the same circle and walking clockwise to the first
-    node point. bisect keeps lookup O(log n) instead of scanning the
-    whole ring.
 
-    note: even w/ 150+ vnodes, load isn't perfectly even (~5pts off
-    from a perfect split in my testing) -- that's expected, not a bug.
-    """
+NODES = _load_nodes()
+ring = HashRing(nodes=list(NODES.keys()))
+REPLICATION_FACTOR = min(int(os.environ.get("REPLICATION_FACTOR", 2)), len(NODES))
 
-    def __init__(self, nodes=None, vnodes=150):
-        self.vnodes = vnodes
-        self.ring = {}
-        self.sorted_points = []
-        self._nodes = set()
-        for node in nodes or []:
-            self.add_node(node)
 
-    def _hash(self, key: str) -> int:
-        return int(hashlib.md5(key.encode()).hexdigest(), 16)
+def preference_list(key: str) -> list[dict]:
+    node_ids = ring.get_preference_list(key, REPLICATION_FACTOR)
+    return [NODES[nid] for nid in node_ids]
 
-    def add_node(self, node: str):
-        if node in self._nodes:
-            return
-        self._nodes.add(node)
-        for i in range(self.vnodes):
-            point = self._hash(f"{node}#{i}")
-            self.ring[point] = node
-        self.sorted_points = sorted(self.ring.keys())
 
-    def remove_node(self, node: str):
-        if node not in self._nodes:
-            return
-        self._nodes.discard(node)
-        for i in range(self.vnodes):
-            point = self._hash(f"{node}#{i}")
-            self.ring.pop(point, None)
-        self.sorted_points = sorted(self.ring.keys())
+def node_addr(node: dict) -> str:
+    return f"{node['host']}:{node['port']}"
 
-    def get_node(self, key: str) -> str:
-        if not self.ring:
-            raise ValueError("hash ring is empty")
-        point = self._hash(key)
-        idx = bisect.bisect(self.sorted_points, point)
-        if idx == len(self.sorted_points):
-            idx = 0
-        return self.ring[self.sorted_points[idx]]
-EOF
+
+@contextmanager
+def node_connection(node: dict):
+    sock = socket.create_connection((node["host"], node["port"]), timeout=2)
+    try:
+        yield sock
+    finally:
+        sock.close()
+
+
+def send_command(node: dict, command: str) -> str:
+    with node_connection(node) as sock:
+        sock.sendall((command + "\n").encode())
+        response = sock.recv(4096).decode()
+        return response.strip()
+
+
+class SetRequest(BaseModel):
+    key: str
+    value: str
+
+
+@app.get("/kv/{key}")
+def get_key(key: str):
+    last_error = None
+    for node in preference_list(key):
+        try:
+            response = send_command(node, f"GET {key}")
+        except OSError as e:
+            last_error = e
+            continue
+        if response.startswith("-NOTFOUND"):
+            raise HTTPException(status_code=404, detail="Key not found")
+        if response.startswith("+"):
+            return {"key": key, "value": response[1:], "node": node_addr(node)}
+        raise HTTPException(status_code=500, detail=response)
+    raise HTTPException(status_code=503, detail=f"all replicas unreachable: {last_error}")
+
+
+@app.put("/kv")
+def set_key(req: SetRequest):
+    nodes = preference_list(req.key)
+    primary, replicas = nodes[0], nodes[1:]
+
+    response = send_command(primary, f"SET {req.key} {req.value}")
+    if not response.startswith("+OK"):
+        raise HTTPException(status_code=500, detail=response)
+
+    replicated_to = []
+    for node in replicas:
+        try:
+            send_command(node, f"SET {req.key} {req.value}")
+            replicated_to.append(node_addr(node))
+        except OSError:
+            pass
+
+    return {
+        "key": req.key,
+        "value": req.value,
+        "node": node_addr(primary),
+        "replicated_to": replicated_to,
+    }
+
+
+@app.delete("/kv/{key}")
+def delete_key(key: str):
+    nodes = preference_list(key)
+    primary, replicas = nodes[0], nodes[1:]
+
+    response = send_command(primary, f"DEL {key}")
+    if response.startswith("-NOTFOUND"):
+        raise HTTPException(status_code=404, detail="Key not found")
+    if not response.startswith("+OK"):
+        raise HTTPException(status_code=500, detail=response)
+
+    for node in replicas:
+        try:
+            send_command(node, f"DEL {key}")
+        except OSError:
+            pass
+
+    return {"key": key, "deleted": True}
+
+
+@app.get("/health")
+def health():
+    results = []
+    for node in NODES.values():
+        try:
+            with node_connection(node):
+                results.append({"node": f"{node['host']}:{node['port']}", "status": "up"})
+        except OSError:
+            results.append({"node": f"{node['host']}:{node['port']}", "status": "down"})
+    return {"nodes": results}
